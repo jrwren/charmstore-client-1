@@ -48,14 +48,14 @@ func (s *superCommand) registerPlugins() {
 	plugins := getPluginDescriptions()
 	s.plugins = make(map[string]cmd.Command, len(plugins))
 	for _, plugin := range plugins {
-		if s.isAvailable(plugin.name) {
+		if s.isAvailable(plugin.Name) {
 			command := &pluginCommand{
-				name:    plugin.name,
-				purpose: plugin.description,
-				doc:     plugin.doc,
+				name:    plugin.Name,
+				purpose: plugin.Description,
+				doc:     plugin.Doc,
 			}
 			s.register(command)
-			s.plugins[plugin.name] = command
+			s.plugins[plugin.Name] = command
 		}
 	}
 	s.SuperCommand.AddHelpTopicCallback(

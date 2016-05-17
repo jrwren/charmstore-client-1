@@ -5,6 +5,7 @@ package charmcmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -97,12 +98,12 @@ func pluginHelpTopic() string {
 	} else {
 		longest := 0
 		for _, plugin := range existingPlugins {
-			if len(plugin.name) > longest {
-				longest = len(plugin.name)
+			if len(plugin.Name) > longest {
+				longest = len(plugin.Name)
 			}
 		}
 		for _, plugin := range existingPlugins {
-			fmt.Fprintf(output, "%-*s  %s\n", longest, plugin.name, plugin.description)
+			fmt.Fprintf(output, "%-*s  %s\n", longest, plugin.Name, plugin.Description)
 		}
 	}
 	return output.String()
@@ -115,6 +116,8 @@ var pluginDescriptionsResults []pluginDescription
 // the plugins are run in parallel, so the function should only take as long
 // as the longest call.
 func getPluginDescriptions() []pluginDescription {
+	pluginCacheDir := os.Getenv("HOME") + "/.cache"
+	pluginCache := pluginCacheDir + "/charm-command-cache"
 	if len(pluginDescriptionsResults) > 0 {
 		return pluginDescriptionsResults
 	}
@@ -122,6 +125,15 @@ func getPluginDescriptions() []pluginDescription {
 	results := []pluginDescription{}
 	if len(plugins) == 0 {
 		return results
+	}
+	if err := os.MkdirAll(pluginCacheDir, os.ModeDir); err != nil {
+		logger.Errorf("creating plugin Cache Dir: %s, %s", pluginCacheDir, err)
+	}
+	if f, err := os.Open(pluginCache); err == nil {
+		decoder := json.NewDecoder(f)
+		if err = decoder.Decode(&results); err == nil {
+			return results
+		}
 	}
 	// Create a channel with enough backing for each plugin.
 	description := make(chan pluginDescription, len(plugins))
@@ -131,7 +143,7 @@ func getPluginDescriptions() []pluginDescription {
 	for _, plugin := range plugins {
 		go func(plugin string) {
 			result := pluginDescription{
-				name: plugin,
+				Name: plugin,
 			}
 			defer func() {
 				description <- result
@@ -141,15 +153,15 @@ func getPluginDescriptions() []pluginDescription {
 
 			if err == nil {
 				// Trim to only get the first line.
-				result.description = strings.SplitN(string(output), "\n", 2)[0]
+				result.Description = strings.SplitN(string(output), "\n", 2)[0]
 			} else {
-				result.description = fmt.Sprintf("error occurred running '%s --description'", plugin)
+				result.Description = fmt.Sprintf("error occurred running '%s --description'", plugin)
 				logger.Debugf("'%s --description': %s", plugin, err)
 			}
 		}(plugin)
 		go func(plugin string) {
 			result := pluginDescription{
-				name: plugin,
+				Name: plugin,
 			}
 			defer func() {
 				help <- result
@@ -157,9 +169,9 @@ func getPluginDescriptions() []pluginDescription {
 			helpcmd := exec.Command(plugin, "--help")
 			output, err := helpcmd.CombinedOutput()
 			if err == nil {
-				result.doc = string(output)
+				result.Doc = string(output)
 			} else {
-				result.doc = fmt.Sprintf("error occured running '%s --help'", plugin)
+				result.Doc = fmt.Sprintf("error occured running '%s --help'", plugin)
 				logger.Debugf("'%s --help': %s", plugin, err)
 			}
 		}(plugin)
@@ -169,26 +181,35 @@ func getPluginDescriptions() []pluginDescription {
 	// Gather the results at the end.
 	for _ = range plugins {
 		result := <-description
-		resultDescriptionMap[result.name] = result
+		resultDescriptionMap[result.Name] = result
 		helpResult := <-help
-		resultHelpMap[helpResult.name] = helpResult
+		resultHelpMap[helpResult.Name] = helpResult
 	}
 	// plugins array is already sorted, use this to get the results in order.
 	for _, plugin := range plugins {
 		// Strip the 'charm-' off the start of the plugin name in the results.
 		result := resultDescriptionMap[plugin]
-		result.name = result.name[len(pluginPrefix):]
-		result.doc = resultHelpMap[plugin].doc
+		result.Name = result.Name[len(pluginPrefix):]
+		result.Doc = resultHelpMap[plugin].Doc
 		results = append(results, result)
 	}
 	pluginDescriptionsResults = results
+
+	if f, err := os.Create(pluginCache); err == nil {
+		encoder := json.NewEncoder(f)
+		if err = encoder.Encode(results); err == nil {
+			logger.Errorf("encoding cached plugin descriptions: %s", err)
+		}
+	} else {
+		logger.Errorf("opening plugin cache file: %s", err)
+	}
 	return results
 }
 
 type pluginDescription struct {
-	name        string
-	description string
-	doc         string
+	Name        string
+	Description string
+	Doc         string
 }
 
 // findPlugins searches the current PATH for executable files that start with
