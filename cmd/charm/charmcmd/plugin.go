@@ -7,11 +7,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -115,24 +114,66 @@ var pluginDescriptionsResults []pluginDescription
 // getPluginDescriptions runs each plugin with "--description".  The calls to
 // the plugins are run in parallel, so the function should only take as long
 // as the longest call.
+// But there was a bug reported on this behavior and it is noticably slow
+// so cache the results and check each plugins mtime to invalidate the plugin.
 func getPluginDescriptions() []pluginDescription {
-	pluginCacheDir := os.Getenv("HOME") + "/.cache"
-	pluginCache := pluginCacheDir + "/charm-command-cache"
 	if len(pluginDescriptionsResults) > 0 {
 		return pluginDescriptionsResults
 	}
-	plugins := findPlugins()
+	pluginCacheDir := os.Getenv("HOME") + "/.cache"
+	pluginCache := pluginCacheDir + "/charm-command-cache"
+	plugins, pluginExists := findPlugins()
 	results := []pluginDescription{}
 	if len(plugins) == 0 {
 		return results
 	}
 	if err := os.MkdirAll(pluginCacheDir, os.ModeDir); err != nil {
-		logger.Errorf("creating plugin Cache Dir: %s, %s", pluginCacheDir, err)
+		logger.Errorf("creating plugin cache dir: %s, %s", pluginCacheDir, err)
 	}
 	if f, err := os.Open(pluginCache); err == nil {
 		decoder := json.NewDecoder(f)
 		if err = decoder.Decode(&results); err == nil {
-			return results
+			cachedExists := map[string]int{}
+		compare:
+			for _, cachedPlugin := range results {
+				cachedExists[pluginPrefix+cachedPlugin.Name]++
+				// If a plugin no longer exists in cache, invalidate entire cache.
+				if pluginExists[pluginPrefix+cachedPlugin.Name] == 0 {
+					results = nil
+					break compare
+				}
+				// Compare ModTime of each found plugin to its cached plugin.
+				for _, newp := range plugins {
+					if newp.name == pluginPrefix+cachedPlugin.Name {
+						filename := newp.dir + "/" + newp.name
+						stat, err2 := os.Stat(filename)
+						if err2 != nil {
+							logger.Errorf("could not stat %s", filename, err2)
+							results = nil
+							break compare
+						}
+						mtime, err2 := strconv.ParseInt(cachedPlugin.ModTime, 0, 64)
+						if stat.ModTime().Unix() != mtime {
+							// We could invalidate just this plugin, but it is a rare occurance so invalidate all.
+							results = nil
+							break compare
+						}
+					}
+				}
+
+			}
+			for _, newp := range plugins {
+				// If the cache is missing a found plugin, invalidate entire cache.
+				if cachedExists[newp.name] == 0 {
+					results = nil
+				}
+			}
+			if results != nil {
+				writeResultsCache(pluginCache, results)
+				return results
+			}
+		} else {
+			logger.Errorf("There was a problem decoding json %s", err)
 		}
 	}
 	// Create a channel with enough backing for each plugin.
@@ -141,38 +182,39 @@ func getPluginDescriptions() []pluginDescription {
 
 	// Exec the --description and --help commands.
 	for _, plugin := range plugins {
-		go func(plugin string) {
+		go func(fi fileInfo) {
 			result := pluginDescription{
-				Name: plugin,
+				Name:    fi.name,
+				ModTime: fi.mtime,
 			}
 			defer func() {
 				description <- result
 			}()
-			desccmd := exec.Command(plugin, "--description")
+			desccmd := exec.Command(fi.name, "--description")
 			output, err := desccmd.CombinedOutput()
 
 			if err == nil {
 				// Trim to only get the first line.
 				result.Description = strings.SplitN(string(output), "\n", 2)[0]
 			} else {
-				result.Description = fmt.Sprintf("error occurred running '%s --description'", plugin)
-				logger.Debugf("'%s --description': %s", plugin, err)
+				result.Description = fmt.Sprintf("error occurred running '%s --description'", fi.name)
+				logger.Debugf("'%s --description': %s", fi.name, err)
 			}
 		}(plugin)
-		go func(plugin string) {
+		go func(fi fileInfo) {
 			result := pluginDescription{
-				Name: plugin,
+				Name: fi.name,
 			}
 			defer func() {
 				help <- result
 			}()
-			helpcmd := exec.Command(plugin, "--help")
+			helpcmd := exec.Command(fi.name, "--help")
 			output, err := helpcmd.CombinedOutput()
 			if err == nil {
 				result.Doc = string(output)
 			} else {
-				result.Doc = fmt.Sprintf("error occured running '%s --help'", plugin)
-				logger.Debugf("'%s --help': %s", plugin, err)
+				result.Doc = fmt.Sprintf("error occured running '%s --help'", fi.name)
+				logger.Debugf("'%s --help': %s", fi.name, err)
 			}
 		}(plugin)
 	}
@@ -188,46 +230,77 @@ func getPluginDescriptions() []pluginDescription {
 	// plugins array is already sorted, use this to get the results in order.
 	for _, plugin := range plugins {
 		// Strip the 'charm-' off the start of the plugin name in the results.
-		result := resultDescriptionMap[plugin]
+		result := resultDescriptionMap[plugin.name]
 		result.Name = result.Name[len(pluginPrefix):]
-		result.Doc = resultHelpMap[plugin].Doc
+		result.Doc = resultHelpMap[plugin.name].Doc
 		results = append(results, result)
 	}
 	pluginDescriptionsResults = results
 
+	writeResultsCache(pluginCache, results)
+	return results
+}
+
+func writeResultsCache(pluginCache string, results []pluginDescription) {
 	if f, err := os.Create(pluginCache); err == nil {
 		encoder := json.NewEncoder(f)
-		if err = encoder.Encode(results); err == nil {
+		if err = encoder.Encode(results); err != nil {
 			logger.Errorf("encoding cached plugin descriptions: %s", err)
 		}
 	} else {
 		logger.Errorf("opening plugin cache file: %s", err)
 	}
-	return results
 }
 
 type pluginDescription struct {
 	Name        string
 	Description string
 	Doc         string
+	ModTime     string
 }
 
 // findPlugins searches the current PATH for executable files that start with
 // pluginPrefix.
-func findPlugins() []string {
+func findPlugins() ([]fileInfo, map[string]int) {
 	path := os.Getenv("PATH")
-	plugins := []string{}
-	for _, name := range filepath.SplitList(path) {
-		entries, err := ioutil.ReadDir(name)
+	plugins := []fileInfo{}
+	seen := map[string]int{}
+	for _, dir := range filepath.SplitList(path) {
+		// ioutil.ReadDir uses lstat on every file and returns a different
+		// modtime than os.Stat do not use ioutil.ReadDir
+		dirh, err := os.Open(dir)
 		if err != nil {
 			continue
 		}
-		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), pluginPrefix) && (entry.Mode()&0111) != 0 {
-				plugins = append(plugins, entry.Name())
+		names, err := dirh.Readdirnames(0)
+		if err != nil {
+			continue
+		}
+		for _, name := range names {
+			if seen[name] > 0 {
+				continue
+			}
+			if strings.HasPrefix(name, pluginPrefix) {
+				stat, err := os.Stat(dir + "/" + name)
+				if err != nil {
+					continue
+				}
+				if (stat.Mode() & 0111) != 0 {
+					plugins = append(plugins, fileInfo{
+						name:  name,
+						mtime: strconv.FormatInt(stat.ModTime().Unix(), 10),
+						dir:   dir,
+					})
+					seen[name]++
+				}
 			}
 		}
 	}
-	sort.Strings(plugins)
-	return plugins
+	return plugins, seen
+}
+
+type fileInfo struct {
+	name  string
+	mtime string
+	dir   string
 }
