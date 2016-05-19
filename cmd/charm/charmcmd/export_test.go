@@ -4,12 +4,13 @@
 package charmcmd
 
 var (
-	ClientGetArchive  = &clientGetArchive
-	CSClientServerURL = &csclientServerURL
-	PluginTopicText   = pluginTopicText
-	ServerURL         = serverURL
-	TranslateError    = translateError
-	USSOTokenPath     = ussoTokenPath
+	ClientGetArchive                       = &clientGetArchive
+	CSClientServerURL                      = &csclientServerURL
+	PluginTopicText                        = pluginTopicText
+	ServerURL                              = serverURL
+	TranslateError                         = translateError
+	USSOTokenPath                          = ussoTokenPath
+	PluginDescriptionLastCallReturnedCache = &pluginDescriptionLastCallReturnedCache
 )
 
 func ResetPluginDescriptionsResults() {

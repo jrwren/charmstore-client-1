@@ -1,4 +1,4 @@
-// Copyright 2015 Canonical Ltd.
+// Copyright 2015-2016 Canonical Ltd.
 // Licensed under the GPLv3, see LICENCE file for details.
 
 package charmcmd
@@ -10,9 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/juju/cmd"
 )
@@ -108,81 +109,49 @@ func pluginHelpTopic() string {
 	return output.String()
 }
 
+var pluginDescriptionLastCallReturnedCache bool
+
 // pluginDescriptionsResults holds memoized results for getPluginDescriptions.
 var pluginDescriptionsResults []pluginDescription
 
 // getPluginDescriptions runs each plugin with "--description".  The calls to
 // the plugins are run in parallel, so the function should only take as long
 // as the longest call.
-// But there was a bug reported on this behavior and it is noticably slow
-// so cache the results and check each plugins mtime to invalidate the plugin.
+// We cache results in $XDG_CACHE_HOME/charm-command-cache
+// or $HOME/.cache/charm-command-cache if $XDG_CACHE_HOME
+// isn't set, invalidating the cache if executable modification times change.
 func getPluginDescriptions() []pluginDescription {
 	if len(pluginDescriptionsResults) > 0 {
 		return pluginDescriptionsResults
 	}
-	pluginCacheDir := os.Getenv("HOME") + "/.cache"
-	pluginCache := pluginCacheDir + "/charm-command-cache"
+	pluginCacheDir := filepath.Join(os.Getenv("HOME"), ".cache")
+	if d := os.Getenv("XDG_CACHE_HOME"); d != "" {
+		pluginCacheDir = d
+	}
+	pluginCache := filepath.Join(pluginCacheDir, "charm-command-cache")
 	plugins, pluginExists := findPlugins()
 	results := []pluginDescription{}
 	if len(plugins) == 0 {
 		return results
 	}
-	if err := os.MkdirAll(pluginCacheDir, os.ModeDir); err != nil {
+	if err := os.MkdirAll(pluginCacheDir, os.ModeDir|os.ModePerm); err != nil {
 		logger.Errorf("creating plugin cache dir: %s, %s", pluginCacheDir, err)
 	}
-	if f, err := os.Open(pluginCache); err == nil {
-		decoder := json.NewDecoder(f)
-		if err = decoder.Decode(&results); err == nil {
-			cachedExists := map[string]int{}
-		compare:
-			for _, cachedPlugin := range results {
-				cachedExists[pluginPrefix+cachedPlugin.Name]++
-				// If a plugin no longer exists in cache, invalidate entire cache.
-				if pluginExists[pluginPrefix+cachedPlugin.Name] == 0 {
-					results = nil
-					break compare
-				}
-				// Compare ModTime of each found plugin to its cached plugin.
-				for _, newp := range plugins {
-					if newp.name == pluginPrefix+cachedPlugin.Name {
-						filename := newp.dir + "/" + newp.name
-						stat, err2 := os.Stat(filename)
-						if err2 != nil {
-							logger.Errorf("could not stat %s", filename, err2)
-							results = nil
-							break compare
-						}
-						mtime, err2 := strconv.ParseInt(cachedPlugin.ModTime, 0, 64)
-						if stat.ModTime().Unix() != mtime {
-							// We could invalidate just this plugin, but it is a rare occurance so invalidate all.
-							results = nil
-							break compare
-						}
-					}
-				}
-
-			}
-			for _, newp := range plugins {
-				// If the cache is missing a found plugin, invalidate entire cache.
-				if cachedExists[newp.name] == 0 {
-					results = nil
-				}
-			}
-			if results != nil {
-				writeResultsCache(pluginCache, results)
-				return results
-			}
-		} else {
-			logger.Errorf("There was a problem decoding json %s", err)
-		}
+	results = readAndReturnCacheIfValid(pluginCache, plugins, pluginExists)
+	if results != nil {
+		pluginDescriptionLastCallReturnedCache = true
+		return results
 	}
+	pluginDescriptionLastCallReturnedCache = false
+
 	// Create a channel with enough backing for each plugin.
 	description := make(chan pluginDescription, len(plugins))
 	help := make(chan pluginDescription, len(plugins))
 
 	// Exec the --description and --help commands.
 	for _, plugin := range plugins {
-		go func(fi fileInfo) {
+		fi := plugin
+		go func() {
 			result := pluginDescription{
 				Name:    fi.name,
 				ModTime: fi.mtime,
@@ -200,8 +169,8 @@ func getPluginDescriptions() []pluginDescription {
 				result.Description = fmt.Sprintf("error occurred running '%s --description'", fi.name)
 				logger.Debugf("'%s --description': %s", fi.name, err)
 			}
-		}(plugin)
-		go func(fi fileInfo) {
+		}()
+		go func() {
 			result := pluginDescription{
 				Name: fi.name,
 			}
@@ -216,7 +185,7 @@ func getPluginDescriptions() []pluginDescription {
 				result.Doc = fmt.Sprintf("error occured running '%s --help'", fi.name)
 				logger.Debugf("'%s --help': %s", fi.name, err)
 			}
-		}(plugin)
+		}()
 	}
 	resultDescriptionMap := map[string]pluginDescription{}
 	resultHelpMap := map[string]pluginDescription{}
@@ -241,6 +210,56 @@ func getPluginDescriptions() []pluginDescription {
 	return results
 }
 
+func readAndReturnCacheIfValid(pluginCache string, plugins []fileInfo, pluginExists map[string]int) []pluginDescription {
+	results := []pluginDescription{}
+	if f, err := os.Open(pluginCache); err == nil {
+		decoder := json.NewDecoder(f)
+		if err = decoder.Decode(&results); err == nil {
+			cachedExists := map[string]int{}
+		compare:
+			for _, cachedPlugin := range results {
+				cachedExists[pluginPrefix+cachedPlugin.Name]++
+				// If a plugin no longer exists in cache, invalidate entire cache.
+				if pluginExists[pluginPrefix+cachedPlugin.Name] == 0 {
+					results = nil
+					break compare
+				}
+				// Compare ModTime of each found plugin to its cached plugin.
+				for _, newp := range plugins {
+					if newp.name == pluginPrefix+cachedPlugin.Name {
+						filename := filepath.Join(newp.dir, newp.name)
+						stat, err2 := os.Stat(filename)
+						if err2 != nil {
+							logger.Errorf("could not stat %s", filename, err2)
+							results = nil
+							break compare
+						}
+						if stat.ModTime() != cachedPlugin.ModTime {
+							// We could invalidate just this plugin, but it is a rare occurance so invalidate all.
+							results = nil
+							break compare
+						}
+					}
+				}
+			}
+			for _, newp := range plugins {
+				// If the cache is missing a found plugin, invalidate entire cache.
+				if cachedExists[newp.name] == 0 {
+					results = nil
+				}
+			}
+
+			// The cache was not invalidated for any reason, so use it.
+			if results != nil {
+				return results
+			}
+		} else {
+			logger.Errorf("There was a problem decoding json %s", err)
+		}
+	}
+	return nil
+}
+
 func writeResultsCache(pluginCache string, results []pluginDescription) {
 	if f, err := os.Create(pluginCache); err == nil {
 		encoder := json.NewEncoder(f)
@@ -256,18 +275,18 @@ type pluginDescription struct {
 	Name        string
 	Description string
 	Doc         string
-	ModTime     string
+	ModTime     time.Time
 }
 
 // findPlugins searches the current PATH for executable files that start with
 // pluginPrefix.
 func findPlugins() ([]fileInfo, map[string]int) {
 	path := os.Getenv("PATH")
-	plugins := []fileInfo{}
+	plugins := fileInfos{}
 	seen := map[string]int{}
 	for _, dir := range filepath.SplitList(path) {
 		// ioutil.ReadDir uses lstat on every file and returns a different
-		// modtime than os.Stat do not use ioutil.ReadDir
+		// modtime than os.Stat.  Do not use ioutil.ReadDir.
 		dirh, err := os.Open(dir)
 		if err != nil {
 			continue
@@ -281,14 +300,14 @@ func findPlugins() ([]fileInfo, map[string]int) {
 				continue
 			}
 			if strings.HasPrefix(name, pluginPrefix) {
-				stat, err := os.Stat(dir + "/" + name)
+				stat, err := os.Stat(filepath.Join(dir, name))
 				if err != nil {
 					continue
 				}
 				if (stat.Mode() & 0111) != 0 {
 					plugins = append(plugins, fileInfo{
 						name:  name,
-						mtime: strconv.FormatInt(stat.ModTime().Unix(), 10),
+						mtime: stat.ModTime(),
 						dir:   dir,
 					})
 					seen[name]++
@@ -296,11 +315,18 @@ func findPlugins() ([]fileInfo, map[string]int) {
 			}
 		}
 	}
+	sort.Sort(plugins)
 	return plugins, seen
 }
 
 type fileInfo struct {
 	name  string
-	mtime string
+	mtime time.Time
 	dir   string
 }
+
+type fileInfos []fileInfo
+
+func (a fileInfos) Len() int           { return len(a) }
+func (a fileInfos) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a fileInfos) Less(i, j int) bool { return a[i].name < a[j].name }
