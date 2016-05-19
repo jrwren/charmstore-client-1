@@ -1,4 +1,4 @@
-// Copyright 2015 Canonical Ltd.
+// Copyright 2015-2016 Canonical Ltd.
 // Licensed under the GPLv3, see LICENCE file for details.
 
 package charmcmd_test
@@ -191,6 +191,56 @@ func (s *pluginSuite) TestPluginRunWithUnknownFlag(c *gc.C) {
 	c.Assert(stderr, gc.Matches, "")
 	c.Assert(code, gc.Equals, 0)
 	c.Assert(stdout, gc.Equals, "the flag was still there.\n")
+}
+
+func (s *pluginSuite) TestPluginCacheCaches(c *gc.C) {
+	s.PatchEnvironment("HOME", "/tmp")
+	os.Remove("/tmp/.cache/charm-command-cache")
+	s.makeFullPlugin(pluginParams{Name: "foo"})
+	run(c.MkDir(), "help", "foo")
+	c.Assert(charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
+	charmcmd.ResetPluginDescriptionsResults()
+	run(c.MkDir(), "help", "foo")
+	c.Assert(charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, true)
+}
+
+func (s *pluginSuite) TestPluginCacheInvalidatesOnUpdate(c *gc.C) {
+	s.PatchEnvironment("HOME", "/tmp")
+	os.Remove("/tmp/.cache/charm-command-cache")
+	s.makeFullPlugin(pluginParams{Name: "foo"})
+	run(c.MkDir(), "help", "foo")
+	c.Assert(charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
+	charmcmd.ResetPluginDescriptionsResults()
+	time.Sleep(time.Second) // Sleep so that the written file has a different mtime
+	//	os.Remove(filepath.Join(s.dir, "charm-foo"))
+	s.makeFullPlugin(pluginParams{Name: "foo"})
+	run(c.MkDir(), "help", "foo")
+	c.Assert(charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
+}
+
+func (s *pluginSuite) TestPluginCacheInvalidatesOnNewPlugin(c *gc.C) {
+	s.PatchEnvironment("HOME", "/tmp")
+	os.Remove("/tmp/.cache/charm-command-cache")
+	s.makeFullPlugin(pluginParams{Name: "foo"})
+	run(c.MkDir(), "help", "foo")
+	c.Assert(charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
+	charmcmd.ResetPluginDescriptionsResults()
+	s.makeFullPlugin(pluginParams{Name: "bar"})
+	run(c.MkDir(), "help", "foo")
+	c.Assert(charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
+}
+
+func (s *pluginSuite) TestPluginCacheInvalidatesOnDeletedPlugin(c *gc.C) {
+	s.PatchEnvironment("HOME", "/tmp")
+	os.Remove("/tmp/.cache/charm-command-cache")
+	s.makeFullPlugin(pluginParams{Name: "foo"})
+	s.makeFullPlugin(pluginParams{Name: "bar"})
+	run(c.MkDir(), "help", "foo")
+	c.Assert(charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
+	charmcmd.ResetPluginDescriptionsResults()
+	os.Remove(filepath.Join(s.dir, "charm-bar"))
+	run(c.MkDir(), "help", "foo")
+	c.Assert(charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
 }
 
 func (s *pluginSuite) makePlugin(name string, perm os.FileMode) {
