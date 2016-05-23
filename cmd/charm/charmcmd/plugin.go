@@ -112,7 +112,7 @@ func pluginHelpTopic() string {
 var pluginDescriptionLastCallReturnedCache bool
 
 // pluginDescriptionsResults holds memoized results for getPluginDescriptions.
-var pluginDescriptionsResults []pluginDescription
+var pluginDescriptionsResults map[string]pluginDescription
 
 // getPluginDescriptions runs each plugin with "--description".  The calls to
 // the plugins are run in parallel, so the function should only take as long
@@ -120,7 +120,7 @@ var pluginDescriptionsResults []pluginDescription
 // We cache results in $XDG_CACHE_HOME/charm-command-cache
 // or $HOME/.cache/charm-command-cache if $XDG_CACHE_HOME
 // isn't set, invalidating the cache if executable modification times change.
-func getPluginDescriptions() []pluginDescription {
+func getPluginDescriptions() map[string]pluginDescription {
 	if len(pluginDescriptionsResults) > 0 {
 		return pluginDescriptionsResults
 	}
@@ -128,19 +128,20 @@ func getPluginDescriptions() []pluginDescription {
 	if d := os.Getenv("XDG_CACHE_HOME"); d != "" {
 		pluginCacheDir = d
 	}
-	pluginCache := filepath.Join(pluginCacheDir, "charm-command-cache")
+	pluginCacheFile := filepath.Join(pluginCacheDir, "charm-command-cache")
 	plugins, pluginExists := findPlugins()
-	results := []pluginDescription{}
+	results := map[string]pluginDescription{}
 	if len(plugins) == 0 {
 		return results
 	}
 	if err := os.MkdirAll(pluginCacheDir, os.ModeDir|os.ModePerm); err != nil {
 		logger.Errorf("creating plugin cache dir: %s, %s", pluginCacheDir, err)
 	}
-	results = readAndReturnCacheIfValid(pluginCache, plugins, pluginExists)
-	if results != nil {
+	pluginCache := openCache(pluginCacheFile)
+	c := readAndReturnCacheIfValid(pluginCache, plugins, pluginExists)
+	if c != nil {
 		pluginDescriptionLastCallReturnedCache = true
-		return results
+		return c
 	}
 	pluginDescriptionLastCallReturnedCache = false
 
@@ -202,73 +203,92 @@ func getPluginDescriptions() []pluginDescription {
 		result := resultDescriptionMap[plugin.name]
 		result.Name = result.Name[len(pluginPrefix):]
 		result.Doc = resultHelpMap[plugin.name].Doc
-		results = append(results, result)
+		results[filepath.Join(plugin.dir, plugin.name)] = result
 	}
 	pluginDescriptionsResults = results
-
-	writeResultsCache(pluginCache, results)
+	pluginCache.Plugins = results
+	pluginCache.save(pluginCacheFile)
 	return results
 }
 
-func readAndReturnCacheIfValid(pluginCache string, plugins []fileInfo, pluginExists map[string]int) []pluginDescription {
-	results := []pluginDescription{}
-	if f, err := os.Open(pluginCache); err == nil {
-		decoder := json.NewDecoder(f)
-		if err = decoder.Decode(&results); err == nil {
-			cachedExists := map[string]int{}
-		compare:
-			for _, cachedPlugin := range results {
-				cachedExists[pluginPrefix+cachedPlugin.Name]++
-				// If a plugin no longer exists in cache, invalidate entire cache.
-				if pluginExists[pluginPrefix+cachedPlugin.Name] == 0 {
-					results = nil
-					break compare
-				}
-				// Compare ModTime of each found plugin to its cached plugin.
-				for _, newp := range plugins {
-					if newp.name == pluginPrefix+cachedPlugin.Name {
-						filename := filepath.Join(newp.dir, newp.name)
-						stat, err2 := os.Stat(filename)
-						if err2 != nil {
-							logger.Errorf("could not stat %s", filename, err2)
-							results = nil
-							break compare
-						}
-						if stat.ModTime() != cachedPlugin.ModTime {
-							// We could invalidate just this plugin, but it is a rare occurance so invalidate all.
-							results = nil
-							break compare
-						}
-					}
+func readAndReturnCacheIfValid(pc *pluginCache, plugins []fileInfo, pluginExists map[string]int) map[string]pluginDescription {
+	cachedPlugins := pc.Plugins
+	if cachedPlugins == nil {
+		return nil
+	}
+	cachedExists := map[string]int{}
+	for _, cachedPlugin := range cachedPlugins {
+		cachedExists[pluginPrefix+cachedPlugin.Name]++
+		// If a plugin no longer exists in cache, invalidate entire cache.
+		if pluginExists[pluginPrefix+cachedPlugin.Name] == 0 {
+			return nil
+		}
+		// Compare ModTime of each found plugin to its cached plugin.
+		for _, newp := range plugins {
+			if newp.name == pluginPrefix+cachedPlugin.Name {
+				p, _ := pc.isCurrent(filepath.Join(newp.dir, newp.name))
+				if p == nil {
+					return nil
 				}
 			}
-			for _, newp := range plugins {
-				// If the cache is missing a found plugin, invalidate entire cache.
-				if cachedExists[newp.name] == 0 {
-					results = nil
-				}
-			}
-
-			// The cache was not invalidated for any reason, so use it.
-			if results != nil {
-				return results
-			}
-		} else {
-			logger.Errorf("There was a problem decoding json %s", err)
 		}
 	}
-	return nil
+	for _, newp := range plugins {
+		// If the cache is missing a found plugin, invalidate entire cache.
+		if cachedExists[newp.name] == 0 {
+			return nil
+		}
+	}
+
+	// The cache was not invalidated for any reason, so use it.
+	return cachedPlugins
 }
 
-func writeResultsCache(pluginCache string, results []pluginDescription) {
-	if f, err := os.Create(pluginCache); err == nil {
+type pluginCache struct {
+	Plugins map[string]pluginDescription
+}
+
+func openCache(file string) *pluginCache {
+	f, err := os.Open(file)
+	var c pluginCache
+	if err != nil {
+		c = pluginCache{}
+		c.Plugins = make(map[string]pluginDescription)
+	}
+	if err := json.NewDecoder(f).Decode(&c); err != nil {
+		c = pluginCache{}
+		c.Plugins = make(map[string]pluginDescription)
+
+	}
+	return &c
+}
+
+func (c *pluginCache) isCurrent(filename string) (*pluginDescription, error) {
+	stat, err := os.Stat(filename)
+	if err != nil {
+		logger.Errorf("could not stat %s", filename, err)
+		return nil, err
+	}
+	if stat.ModTime() != c.Plugins[filename].ModTime {
+		// We could invalidate just this plugin, but it is a rare occurence so invalidate all.
+		return nil, nil
+	}
+	p := c.Plugins[filename]
+	return &p, nil
+}
+
+func (c *pluginCache) save(filename string) error {
+	if f, err := os.Create(filename); err == nil {
 		encoder := json.NewEncoder(f)
-		if err = encoder.Encode(results); err != nil {
+		if err = encoder.Encode(c); err != nil {
 			logger.Errorf("encoding cached plugin descriptions: %s", err)
+			return err
 		}
 	} else {
 		logger.Errorf("opening plugin cache file: %s", err)
+		return err
 	}
+	return nil
 }
 
 type pluginDescription struct {
