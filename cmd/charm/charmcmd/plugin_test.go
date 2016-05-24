@@ -38,6 +38,8 @@ func (s *pluginSuite) SetUpTest(c *gc.C) {
 	s.dir2 = c.MkDir()
 	s.PatchEnvironment("PATH", s.dir+":"+s.dir2)
 	charmcmd.ResetPluginDescriptionsResults()
+	os.Remove("/tmp/.cache/charm-command-cache")
+	os.Remove(filepath.Join(os.Getenv("HOME"), ".cache/charm-command-cache"))
 }
 
 func (*pluginSuite) TestPluginHelpNoPlugins(c *gc.C) {
@@ -108,7 +110,7 @@ func (s *pluginSuite) TestPluginHelpRunInParallel(c *gc.C) {
 		c.Assert(stderr, gc.Equals, "")
 		outputChan <- stdout
 	}()
-	// 10 seconds is arbitrary but should always be generously long. Test
+	// This time is arbitrary but should always be generously long. Test
 	// actually only takes about 15ms in practice, but 10s allows for system
 	// hiccups, etc.
 	wait := 5 * time.Second
@@ -195,7 +197,6 @@ func (s *pluginSuite) TestPluginRunWithUnknownFlag(c *gc.C) {
 
 func (s *pluginSuite) TestPluginCacheCaches(c *gc.C) {
 	s.PatchEnvironment("HOME", "/tmp")
-	os.Remove("/tmp/.cache/charm-command-cache")
 	s.makeFullPlugin(pluginParams{Name: "foo"})
 	run(c.MkDir(), "help", "foo")
 	c.Assert(*charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
@@ -206,7 +207,6 @@ func (s *pluginSuite) TestPluginCacheCaches(c *gc.C) {
 
 func (s *pluginSuite) TestPluginCacheInvalidatesOnUpdate(c *gc.C) {
 	s.PatchEnvironment("HOME", "/tmp")
-	os.Remove("/tmp/.cache/charm-command-cache")
 	s.makeFullPlugin(pluginParams{Name: "foo"})
 	run(c.MkDir(), "help", "foo")
 	c.Assert(*charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
@@ -219,25 +219,11 @@ func (s *pluginSuite) TestPluginCacheInvalidatesOnUpdate(c *gc.C) {
 
 func (s *pluginSuite) TestPluginCacheInvalidatesOnNewPlugin(c *gc.C) {
 	s.PatchEnvironment("HOME", "/tmp")
-	os.Remove("/tmp/.cache/charm-command-cache")
 	s.makeFullPlugin(pluginParams{Name: "foo"})
 	run(c.MkDir(), "help", "foo")
 	c.Assert(*charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
 	charmcmd.ResetPluginDescriptionsResults()
 	s.makeFullPlugin(pluginParams{Name: "bar"})
-	run(c.MkDir(), "help", "foo")
-	c.Assert(*charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
-}
-
-func (s *pluginSuite) TestPluginCacheInvalidatesOnDeletedPlugin(c *gc.C) {
-	s.PatchEnvironment("HOME", "/tmp")
-	os.Remove("/tmp/.cache/charm-command-cache")
-	s.makeFullPlugin(pluginParams{Name: "foo"})
-	s.makeFullPlugin(pluginParams{Name: "bar"})
-	run(c.MkDir(), "help", "foo")
-	c.Assert(*charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
-	charmcmd.ResetPluginDescriptionsResults()
-	os.Remove(filepath.Join(s.dir, "charm-bar"))
 	run(c.MkDir(), "help", "foo")
 	c.Assert(*charmcmd.PluginDescriptionLastCallReturnedCache, gc.Equals, false)
 }

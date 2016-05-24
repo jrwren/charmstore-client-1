@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -97,18 +98,23 @@ func pluginHelpTopic() string {
 		fmt.Fprintf(output, "No plugins found.\n")
 	} else {
 		longest := 0
-		for _, plugin := range existingPlugins {
+		keys := make([]string, 0, len(existingPlugins))
+		for k, plugin := range existingPlugins {
 			if len(plugin.Name) > longest {
 				longest = len(plugin.Name)
 			}
+			keys = append(keys, k)
 		}
-		for _, plugin := range existingPlugins {
+		sort.Strings(keys)
+		for _, k := range keys {
+			plugin := existingPlugins[k]
 			fmt.Fprintf(output, "%-*s  %s\n", longest, plugin.Name, plugin.Description)
 		}
 	}
 	return output.String()
 }
 
+// pluginDescriptionLastCallReturnedCache is true if all plugins values were cached.
 var pluginDescriptionLastCallReturnedCache bool
 
 // pluginDescriptionsResults holds memoized results for getPluginDescriptions.
@@ -129,128 +135,44 @@ func getPluginDescriptions() map[string]pluginDescription {
 		pluginCacheDir = d
 	}
 	pluginCacheFile := filepath.Join(pluginCacheDir, "charm-command-cache")
-	plugins, pluginExists := findPlugins()
-	results := map[string]pluginDescription{}
+	plugins, _ := findPlugins()
 	if len(plugins) == 0 {
-		return results
+		return map[string]pluginDescription{}
 	}
 	if err := os.MkdirAll(pluginCacheDir, os.ModeDir|os.ModePerm); err != nil {
 		logger.Errorf("creating plugin cache dir: %s, %s", pluginCacheDir, err)
 	}
 	pluginCache := openCache(pluginCacheFile)
-	c := readAndReturnCacheIfValid(pluginCache, plugins, pluginExists)
-	if c != nil {
-		pluginDescriptionLastCallReturnedCache = true
-		return c
-	}
-	pluginDescriptionLastCallReturnedCache = false
-
-	// Create a channel with enough backing for each plugin.
-	description := make(chan pluginDescription, len(plugins))
-	help := make(chan pluginDescription, len(plugins))
-
-	// Exec the --description and --help commands.
+	allcached := true
+	allcachedLock := sync.RWMutex{}
+	wg := sync.WaitGroup{}
 	for _, plugin := range plugins {
-		fi := plugin
+		wg.Add(1)
+		plugin := plugin
 		go func() {
-			result := pluginDescription{
-				Name:    fi.name,
-				ModTime: fi.mtime,
-			}
-			defer func() {
-				description <- result
-			}()
-			desccmd := exec.Command(fi.name, "--description")
-			output, err := desccmd.CombinedOutput()
-
-			if err == nil {
-				// Trim to only get the first line.
-				result.Description = strings.SplitN(string(output), "\n", 2)[0]
-			} else {
-				result.Description = fmt.Sprintf("error occurred running '%s --description'", fi.name)
-				logger.Debugf("'%s --description': %s", fi.name, err)
-			}
-		}()
-		go func() {
-			result := pluginDescription{
-				Name: fi.name,
-			}
-			defer func() {
-				help <- result
-			}()
-			helpcmd := exec.Command(fi.name, "--help")
-			output, err := helpcmd.CombinedOutput()
-			if err == nil {
-				result.Doc = string(output)
-			} else {
-				result.Doc = fmt.Sprintf("error occured running '%s --help'", fi.name)
-				logger.Debugf("'%s --help': %s", fi.name, err)
-			}
+			defer wg.Done()
+			_, cached := pluginCache.fetch(plugin)
+			allcachedLock.Lock()
+			allcached = allcached && cached
+			allcachedLock.Unlock()
 		}()
 	}
-	resultDescriptionMap := map[string]pluginDescription{}
-	resultHelpMap := map[string]pluginDescription{}
-	// Gather the results at the end.
-	for _ = range plugins {
-		result := <-description
-		resultDescriptionMap[result.Name] = result
-		helpResult := <-help
-		resultHelpMap[helpResult.Name] = helpResult
-	}
-	// plugins array is already sorted, use this to get the results in order.
-	for _, plugin := range plugins {
-		// Strip the 'charm-' off the start of the plugin name in the results.
-		result := resultDescriptionMap[plugin.name]
-		result.Name = result.Name[len(pluginPrefix):]
-		result.Doc = resultHelpMap[plugin.name].Doc
-		results[filepath.Join(plugin.dir, plugin.name)] = result
-	}
-	pluginDescriptionsResults = results
-	pluginCache.Plugins = results
+	wg.Wait()
+	pluginDescriptionLastCallReturnedCache = allcached
 	pluginCache.save(pluginCacheFile)
-	return results
-}
-
-func readAndReturnCacheIfValid(pc *pluginCache, plugins []fileInfo, pluginExists map[string]int) map[string]pluginDescription {
-	cachedPlugins := pc.Plugins
-	if cachedPlugins == nil {
-		return nil
-	}
-	cachedExists := map[string]int{}
-	for _, cachedPlugin := range cachedPlugins {
-		cachedExists[pluginPrefix+cachedPlugin.Name]++
-		// If a plugin no longer exists in cache, invalidate entire cache.
-		if pluginExists[pluginPrefix+cachedPlugin.Name] == 0 {
-			return nil
-		}
-		// Compare ModTime of each found plugin to its cached plugin.
-		for _, newp := range plugins {
-			if newp.name == pluginPrefix+cachedPlugin.Name {
-				p, _ := pc.isCurrent(filepath.Join(newp.dir, newp.name))
-				if p == nil {
-					return nil
-				}
-			}
-		}
-	}
-	for _, newp := range plugins {
-		// If the cache is missing a found plugin, invalidate entire cache.
-		if cachedExists[newp.name] == 0 {
-			return nil
-		}
-	}
-
-	// The cache was not invalidated for any reason, so use it.
-	return cachedPlugins
+	pluginDescriptionsResults = pluginCache.Plugins
+	return pluginCache.Plugins
 }
 
 type pluginCache struct {
-	Plugins map[string]pluginDescription
+	Plugins     map[string]pluginDescription
+	pluginsLock sync.RWMutex
 }
 
 func openCache(file string) *pluginCache {
 	f, err := os.Open(file)
 	var c pluginCache
+	c.pluginsLock = sync.RWMutex{}
 	if err != nil {
 		c = pluginCache{}
 		c.Plugins = make(map[string]pluginDescription)
@@ -258,23 +180,71 @@ func openCache(file string) *pluginCache {
 	if err := json.NewDecoder(f).Decode(&c); err != nil {
 		c = pluginCache{}
 		c.Plugins = make(map[string]pluginDescription)
-
 	}
 	return &c
 }
 
-func (c *pluginCache) isCurrent(filename string) (*pluginDescription, error) {
+// returns pluginDescription and boolean indicating if cache was used.
+func (c *pluginCache) fetch(fi fileInfo) (*pluginDescription, bool) {
+	filename := filepath.Join(fi.dir, fi.name)
 	stat, err := os.Stat(filename)
 	if err != nil {
 		logger.Errorf("could not stat %s", filename, err)
-		return nil, err
+		// If a file is not readable or otherwise not statable, ignore it.
+		return nil, false
 	}
-	if stat.ModTime() != c.Plugins[filename].ModTime {
-		// We could invalidate just this plugin, but it is a rare occurence so invalidate all.
-		return nil, nil
+	mtime := stat.ModTime()
+	c.pluginsLock.RLock()
+	p, ok := c.Plugins[filename]
+	c.pluginsLock.RUnlock()
+	// If the plugin is cached check its mtime.
+	if ok {
+		// If mtime is same as cached, return the cached data.
+		if mtime.Unix() == p.ModTime.Unix() {
+			return &p, true
+		}
 	}
-	p := c.Plugins[filename]
-	return &p, nil
+	// The cached data is invalid. Run the plugin.
+	result := pluginDescription{
+		Name:    fi.name[len(pluginPrefix):],
+		ModTime: mtime,
+	}
+	wg := sync.WaitGroup{}
+	desc := ""
+	help := ""
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		desccmd := exec.Command(fi.name, "--description")
+		output, err := desccmd.CombinedOutput()
+
+		if err == nil {
+			// Trim to only get the first line.
+			desc = strings.SplitN(string(output), "\n", 2)[0]
+		} else {
+			desc = fmt.Sprintf("error occurred running '%s --description'", fi.name)
+			logger.Debugf("'%s --description': %s", fi.name, err)
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		helpcmd := exec.Command(fi.name, "--help")
+		output, err := helpcmd.CombinedOutput()
+		if err == nil {
+			help = string(output)
+		} else {
+			help = fmt.Sprintf("error occured running '%s --help'", fi.name)
+			logger.Debugf("'%s --help': %s", fi.name, err)
+		}
+	}()
+	wg.Wait()
+	result.Doc = help
+	result.Description = desc
+	c.pluginsLock.Lock()
+	c.Plugins[filename] = result
+	c.pluginsLock.Unlock()
+	return &result, false
 }
 
 func (c *pluginCache) save(filename string) error {
